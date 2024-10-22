@@ -299,7 +299,7 @@ class Generic_MIL_Survival_Dataset(Generic_WSI_Survival_Dataset):
 
 
 class Generic_Split(Generic_MIL_Survival_Dataset):
-    def __init__(self, slide_data, metadata, modal, signatures=None, data_dir=None, label_col=None, patient_dict=None, num_classes=2,OOM=1024):
+    def __init__(self, slide_data, metadata, modal, signatures=None, data_dir=None, label_col=None, patient_dict=None, num_classes=2,OOM=2048):
         self.use_h5 = False
         self.slide_data = slide_data
         self.metadata = metadata
@@ -310,6 +310,7 @@ class Generic_Split(Generic_MIL_Survival_Dataset):
         self.patient_dict = patient_dict
         self.slide_cls_ids = [[] for i in range(self.num_classes)]
         self.OOM=OOM
+
         for i in range(self.num_classes):
             self.slide_cls_ids[i] = np.where(self.slide_data['label'] == i)[0]
 

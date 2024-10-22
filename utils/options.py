@@ -8,7 +8,8 @@ def parse_args():
     parser.add_argument(
         "--data_root_dir", type=str, default="path/to/data_root_dir", help="Data directory to WSI features (extracted via CLAM"
     )
-    parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducible experiment (default: 1)")
+    parser.add_argument("--seed", type=int, default=3407, help="Random seed for reproducible experiment (default: 1)")
+
     parser.add_argument(
         "--which_splits", type=str, default="5foldcv", help="Which splits folder to use in ./splits/ (Default: ./splits/5foldcv"
     )
@@ -48,29 +49,50 @@ def parse_args():
         default="coattn",
         help="Specifies which modalities to use / collate function in dataloader.",
     )
-    parser.add_argument(
-        "--fusion",
-        type=str,
-        choices=["concat", "bilinear"],
-        default="concat",
-        help="Modality fuison strategy",
-    )
-    parser.add_argument("--alpha", type=float, default=0.5, help="hyper-parameter of loss function")
 
+    parser.add_argument("--alpha", type=float, default=0.5, help="hyper-parameter of loss function")
     # Optimizer Parameters + Survival Loss Function
     parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam",
                         "AdamW", "RAdam", "PlainRAdam", "Lookahead"], default="Adam")
     parser.add_argument("--scheduler", type=str, choices=["None", "exp", "step", "plateau", "cosine"], default="cosine")
+
     parser.add_argument("--num_epoch", type=int, default=20, help="Maximum number of epochs to train (default: 20)")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch Size (Default: 1, due to varying bag sizes)")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate (default: 0.0001)")
-    parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
+
+
     parser.add_argument(
         "--loss",
         type=str,
         default="nll_surv",
         help="slide-level classification loss function (default: ce)",
     )
+
     parser.add_argument("--weighted_sample", action="store_true", default=True, help="Enable weighted sampling")
+
+
+    # =======================================
+    parser.add_argument("--F_alpha", type=float, default=0.5, help="The proportion of genes involved in fusion")
+    parser.add_argument("--F_beta", type=float, default=0.5,
+                        help="The proportion of fine particle size in multi-particle size fusion")
+
+    parser.add_argument("--GT", type=float, default=0.5, help="Temperature of gene token selection means current num*T")
+    parser.add_argument("--PT", type=float, default=0.5,
+                        help="Temperature of img token selection means current num*T")
+
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate (default: 0.0001)")
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
+    parser.add_argument("--tokenS", type=str, choices=["both", "G", "P","N"], default="both")
+    parser.add_argument(
+        "--fusion",
+        type=str,
+        choices=["concat", "bilinear","hyperbolic","fineCoarse","Mamba","Aconcat"],
+        default="concat",
+        help="Modality fuison strategy",
+    )
+    parser.add_argument("--MoELoss", action="store_false", default=False, help=" MoE Negative distance loss")
+    parser.add_argument("--LossRate", type=float, default=1e-5, help="MoELoss rate")
+
+    parser.add_argument("--modality", type=str, choices=["Both", "G", "P"],default="Both",help= "Modality to test")
+    # =======================================
     args = parser.parse_args()
     return args

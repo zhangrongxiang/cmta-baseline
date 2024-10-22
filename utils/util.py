@@ -10,7 +10,7 @@ def collate_MIL_survival(batch):
     omic = torch.cat([item[1] for item in batch], dim = 0).type(torch.FloatTensor)
     label = torch.LongTensor([int(item[2]) for item in batch])
     event_time = np.array([item[3] for item in batch])
-    c = torch.FloatTensor([item[4] for item in batch])
+    c = torch.FloatTensor([int(item[4]) for item in batch])
     return [img, omic, label, event_time, c]
 
 def collate_MIL_survival_cluster(batch):

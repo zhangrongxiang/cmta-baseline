@@ -2,7 +2,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-
+import math
 from .util import initialize_weights
 from .util import NystromAttention
 from .util import BilinearFusion
@@ -10,8 +10,74 @@ from .util import SNN_Block
 from .util import MultiheadAttention
 
 
+# ==================================================================================
+
+def dissimilarity_loss(A, B):
+    assert A.shape == B.shape, "A and B must have the same shape"
+    A_flat = A.view(A.size(0), -1)  # 展平成 B x (N*Dim)
+    B_flat = B.view(B.size(0), -1)  # 展平成 B x (N*Dim)
+    euclidean_distance = torch.norm(A_flat - B_flat, p=2, dim=-1)
+    loss = (1 / (euclidean_distance + 1e-8)).mean()
+    return loss
+
+# 定义 FFNExpert 类
+class FFNExpert(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(FFNExpert, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.LayerNorm(hidden_dim)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_dim, input_dim)
+        self.bn2 = nn.LayerNorm(input_dim)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.fc1(x)))
+        x = self.bn2(self.fc2(x))
+        return x
+# 定义 MoE 类
+class MoE(nn.Module):
+    def __init__(self, input_dim=512, num_experts=4, k=2):
+        super(MoE, self).__init__()
+        self.k = k
+        self.gate = nn.Linear(input_dim, num_experts)
+        self.experts = nn.ModuleList(
+            [FFNExpert(input_dim, input_dim) for _ in range(num_experts)])
+
+    def forward(self, x):
+        B, N, input_dim = x.shape
+        x_reshaped = x.view(B * N, input_dim)
+        gate_scores = self.gate(x_reshaped)
+        topk_scores, topk_indices = gate_scores.view(B, N, -1).topk(self.k, dim=2)
+        bottomk_scores, bottomk_indices = gate_scores.view(B, N, -1).topk(self.k, dim=2, largest=False)
+
+        expert_outputs_top = torch.zeros(B, N, self.k, input_dim, device=x.device)
+        expert_outputs_bottom = torch.zeros(B, N, self.k, input_dim, device=x.device)
+
+        for b in range(B):
+            for n in range(N):
+                for i, idx in enumerate(topk_indices[b, n]):
+                    expert_outputs_top[b, n, i] = self.experts[idx](x[b, n].unsqueeze(0))
+                for i, idx in enumerate(bottomk_indices[b, n]):
+                    expert_outputs_bottom[b, n, i] = self.experts[idx](x[b, n].unsqueeze(0))
+
+        weights_top = torch.softmax(topk_scores, dim=2).unsqueeze(-1)
+        weights_bottom = torch.softmax(bottomk_scores, dim=2).unsqueeze(-1)
+
+        output_top = (weights_top * expert_outputs_top).sum(dim=2)
+        output_bottom = (weights_bottom * expert_outputs_bottom).sum(dim=2)
+
+        orthogonality_loss = dissimilarity_loss(output_top, output_bottom)
+
+        output = output_top + x
+
+        return output, output_top, output_bottom, orthogonality_loss
+
+
+# =========================================================================================
+
+
 class TransLayer(nn.Module):
-    def __init__(self, norm_layer=nn.LayerNorm, dim=512):
+    def __init__(self, norm_layer=nn.LayerNorm, dim=512, num_experts=4, k=2):
         super().__init__()
         self.norm = norm_layer(dim)
         self.attn = NystromAttention(
@@ -19,10 +85,13 @@ class TransLayer(nn.Module):
             dim_head=dim // 8,
             heads=8,
             num_landmarks=dim // 2,  # number of landmarks
-            pinv_iterations=6,  # number of moore-penrose iterations for approximating pinverse. 6 was recommended by the paper
-            residual=True,  # whether to do an extra residual with the value or not. supposedly faster convergence if turned on
+            pinv_iterations=6,
+            # number of moore-penrose iterations for approximating pinverse. 6 was recommended by the paper
+            residual=True,
+            # whether to do an extra residual with the value or not. supposedly faster convergence if turned on
             dropout=0.1,
         )
+        self.moe = MoE(input_dim=dim, num_experts=num_experts, k=k)
 
     def forward(self, x):
         x = x + self.attn(self.norm(x))
@@ -47,7 +116,7 @@ class PPEG(nn.Module):
 
 
 class Transformer_P(nn.Module):
-    def __init__(self, feature_dim=512):
+    def __init__(self, feature_dim=512, num_experts=4, k=2):
         super(Transformer_P, self).__init__()
         # Encoder
         self.pos_layer = PPEG(dim=feature_dim)
@@ -55,6 +124,7 @@ class Transformer_P(nn.Module):
         nn.init.normal_(self.cls_token, std=1e-6)
         self.layer1 = TransLayer(dim=feature_dim)
         self.layer2 = TransLayer(dim=feature_dim)
+
         self.norm = nn.LayerNorm(feature_dim)
         # Decoder
 
@@ -70,47 +140,104 @@ class Transformer_P(nn.Module):
         h = torch.cat((cls_tokens, h), dim=1)
         # ---->Translayer x1
         h = self.layer1(h)  # [B, N, 512]
+        # ---->MoE layer
+        #   h = self.moe(h)  # [B, N, 512]
         # ---->PPEG
         h = self.pos_layer(h, _H, _W)  # [B, N, 512]
         # ---->Translayer x2
         h = self.layer2(h)  # [B, N, 512]
         # ---->cls_token
-        h = self.norm(h)
+        # h = self.norm(h)
+
         return h[:, 0], h[:, 1:]
 
 
 class Transformer_G(nn.Module):
-    def __init__(self, feature_dim=512):
+    def __init__(self, feature_dim=512, num_experts=4, k=2):
         super(Transformer_G, self).__init__()
         # Encoder
+        self.pos_layer = PPEG(dim=feature_dim)
         self.cls_token = nn.Parameter(torch.randn(1, 1, feature_dim))
         nn.init.normal_(self.cls_token, std=1e-6)
         self.layer1 = TransLayer(dim=feature_dim)
         self.layer2 = TransLayer(dim=feature_dim)
+        self.moe = MoE(input_dim=feature_dim, num_experts=num_experts, k=k)
         self.norm = nn.LayerNorm(feature_dim)
         # Decoder
 
     def forward(self, features):
         # ---->pad
-        cls_tokens = self.cls_token.expand(features.shape[0], -1, -1).cuda()
-        h = torch.cat((cls_tokens, features), dim=1)
+        H = features.shape[1]
+        _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
+        add_length = _H * _W - H
+        h = torch.cat([features, features[:, :add_length, :]], dim=1)  # [B, N, 512]
+        # ---->cls_token
+        B = h.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1).cuda()
+        h = torch.cat((cls_tokens, h), dim=1)
         # ---->Translayer x1
+        # h = self.moe(h)
+
         h = self.layer1(h)  # [B, N, 512]
+        # ---->MoE layer
+        h ,_1,__1,Nloss1= self.moe(h)  # [B, N, 512]
+        # ---->PPEG
+        # h = self.pos_layer(h, _H, _W)  # [B, N, 512]
         # ---->Translayer x2
         h = self.layer2(h)  # [B, N, 512]
         # ---->cls_token
-        h = self.norm(h)
-        return h[:, 0], h[:, 1:]
+        # ---->MoE layer
+        h ,_2,__2,Nloss2= self.moe(h)  # [B, N, 512]
 
+        return h[:, 0], h[:, 1:],Nloss1+Nloss2
+
+
+class token_selection(nn.Module):
+    def __init__(self):
+        super(token_selection, self).__init__()
+        self.MLP_f = nn.Linear(256, 128)
+        self.MLP_s= nn.Linear(256, 256)
+        self.softmax = nn.Softmax(dim=1)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.25)
+
+    def forward(self, start_patch_token, cls_token,Temperature):
+        half_token_patch = self.MLP_f(start_patch_token)
+        half_token_patch = self.dropout(half_token_patch)
+        half_token_cls = self.MLP_f(cls_token)
+        half_token_cls = half_token_cls.unsqueeze(1)
+        half_token_cls = half_token_cls.repeat(1, start_patch_token.size(1), 1)  # Corrected this line
+        patch_token = torch.cat([half_token_cls, half_token_patch], dim=2)
+        patch_token = self.MLP_s(patch_token)
+        patch_token = self.dropout(patch_token)
+        _patch_token = self.softmax(patch_token)
+        topk_values, topk_indices = torch.topk(_patch_token, math.ceil(start_patch_token.size(1)*Temperature), dim=1)
+        final_token = torch.gather(start_patch_token, 1, topk_indices.squeeze(1))  # Squeeze the last dimension here
+
+        return final_token
+
+
+
+from hypll.manifolds.poincare_ball import Curvature, PoincareBall
+from hypll.tensors import TangentTensor
+from torch import nn
+from hypll import nn as hnn
+
+
+manifold = PoincareBall(c=Curvature(requires_grad=True))
 
 class CMTA(nn.Module):
-    def __init__(self, omic_sizes=[100, 200, 300, 400, 500, 600], n_classes=4, fusion="concat", model_size="small"):
+    def __init__(self, omic_sizes=[100, 200, 300, 400, 500, 600], n_classes=4, fusion="concat", model_size="small",alpha=0.5,beta=0.5,tokenS="both",GT=0.5,PT=0.5):
         super(CMTA, self).__init__()
 
         self.omic_sizes = omic_sizes
         self.n_classes = n_classes
         self.fusion = fusion
-
+        self.alpha=alpha
+        self.beta=beta
+        self.tokenS=tokenS
+        self.GT=GT
+        self.PT=PT
         ###
         self.size_dict = {
             "pathomics": {"small": [1024, 256, 256], "large": [1024, 512, 256]},
@@ -151,13 +278,39 @@ class CMTA(nn.Module):
         # Decoder
         self.genomics_decoder = Transformer_G(feature_dim=hidden[-1])
 
+        self.hyperbolic_fc1 = hnn.HLinear(in_features=hidden[-1] * 2, out_features=hidden[-1], manifold=manifold)
+        self.hyperbolic_fc2 = hnn.HLinear(in_features=hidden[-1], out_features=hidden[-1], manifold=manifold)
+        self.hyperbolic_relu = hnn.HReLU(manifold=manifold)
+        self.token_selection = token_selection()
+
+
         # Classification Layer
-        if self.fusion == "concat":
+        if self.fusion == "Aconcat" or self.fusion == "concat":
+            self.mm = nn.Sequential(
+                *[nn.Linear(hidden[-1] * 2, hidden[-1]), nn.ReLU(), nn.Linear(hidden[-1], hidden[-1]), nn.ReLU()]
+            )
+        elif self.fusion == "fineCoarse":
             self.mm = nn.Sequential(
                 *[nn.Linear(hidden[-1] * 2, hidden[-1]), nn.ReLU(), nn.Linear(hidden[-1], hidden[-1]), nn.ReLU()]
             )
         elif self.fusion == "bilinear":
             self.mm = BilinearFusion(dim1=hidden[-1], dim2=hidden[-1], scale_dim1=8, scale_dim2=8, mmhid=hidden[-1])
+        elif self.fusion == "hyperbolic":
+            self.hyperbolic_mm = nn.Sequential(
+                self.hyperbolic_fc1,
+                self.hyperbolic_relu,
+                self.hyperbolic_fc2,
+                self.hyperbolic_relu,
+                self.hyperbolic_fc2
+            )
+        elif self.fusion == "hyperbolic":
+            self.hyperbolic_mm = nn.Sequential(
+                self.hyperbolic_fc1,
+                self.hyperbolic_relu,
+                self.hyperbolic_fc2,
+                self.hyperbolic_relu,
+                self.hyperbolic_fc2
+            )
         else:
             raise NotImplementedError("Fusion [{}] is not implemented".format(self.fusion))
 
@@ -176,16 +329,39 @@ class CMTA(nn.Module):
         genomics_features = torch.stack(genomics_features).unsqueeze(0)  # [1, 6, 1024]
         # pathomics embedding
         pathomics_features = self.pathomics_fc(x_path).unsqueeze(0)
-
+        # print("genomics_features.shape: ",genomics_features.shape)
+        # print("pathomics_features.shape:",pathomics_features.shape)
         # encoder
         # pathomics encoder
         cls_token_pathomics_encoder, patch_token_pathomics_encoder = self.pathomics_encoder(
             pathomics_features)  # cls token + patch tokens
         # genomics encoder
-        cls_token_genomics_encoder, patch_token_genomics_encoder = self.genomics_encoder(
+        cls_token_genomics_encoder, patch_token_genomics_encoder ,Nloss1= self.genomics_encoder(
             genomics_features)  # cls token + patch tokens
 
+        # print("cls_token_pathomics_encoder.shape: ",cls_token_pathomics_encoder.shape)
+        # print("cls_token_genomics_encoder.shape: ",cls_token_genomics_encoder.shape)
+        # print("patch_token_pathomics_encoder.shape: ",patch_token_pathomics_encoder.shape)
+        # print("patch_token_genomics_encoder.shape: ",patch_token_genomics_encoder.shape)
         # cross-omics attention
+
+        #=============== token selection;
+
+        if self.tokenS=="both":
+            patch_token_pathomics_encoder=self.token_selection(patch_token_pathomics_encoder, cls_token_pathomics_encoder,self.PT)
+            patch_token_genomics_encoder=self.token_selection(patch_token_genomics_encoder, cls_token_genomics_encoder,self.GT)
+        elif self.tokenS=="P":
+            patch_token_pathomics_encoder=self.token_selection(patch_token_pathomics_encoder, cls_token_pathomics_encoder,self.PT)
+        elif self.tokenS=="G":
+            patch_token_genomics_encoder=self.token_selection(patch_token_genomics_encoder, cls_token_genomics_encoder,self.GT)
+        elif self.tokenS=="N":
+            pass
+
+        # =============== token selection;
+        # print("===========")
+        # print("patch_token_pathomics_encoder.shape: ", patch_token_pathomics_encoder.shape)
+        # print("patch_token_genomics_encoder.shape: ", patch_token_genomics_encoder.shape)
+        # print("===========")
         pathomics_in_genomics, Att = self.P_in_G_Att(
             patch_token_pathomics_encoder.transpose(1, 0),
             patch_token_genomics_encoder.transpose(1, 0),
@@ -197,14 +373,23 @@ class CMTA(nn.Module):
             patch_token_pathomics_encoder.transpose(1, 0),
         )  # ([7, 1, 256])
         # decoder
+        # print(" pathomics_in_genomics: " ,pathomics_in_genomics.shape)
+        # print(" genomics_in_pathomics: " ,genomics_in_pathomics.shape)
+
+
         # pathomics decoder
         cls_token_pathomics_decoder, _ = self.pathomics_decoder(
             pathomics_in_genomics.transpose(1, 0))  # cls token + patch tokens
         # genomics decoder
-        cls_token_genomics_decoder, _ = self.genomics_decoder(
+        cls_token_genomics_decoder,_,Nloss2 = self.genomics_decoder(
             genomics_in_pathomics.transpose(1, 0))  # cls token + patch tokens
-
+        # cls_token_pathomics_decoder, _ = self.genomics_decoder(patch_token_pathomics_encoder )
+        # cls_token_genomics_decoder, _ = self.genomics_decoder(patch_token_genomics_encoder)
         # fusion
+        # print("cls_token_pathomics_encoder", cls_token_pathomics_encoder.shape)
+        # print("cls_token_genomics_encoder", cls_token_genomics_encoder.shape)
+        # print("cls_token_pathomics_decoder", cls_token_pathomics_decoder.shape)
+        # print("cls_token_genomics_decoder", cls_token_genomics_decoder.shape)
         if self.fusion == "concat":
             fusion = self.mm(
                 torch.concat(
@@ -215,16 +400,74 @@ class CMTA(nn.Module):
                     dim=1,
                 )
             )  # take cls token to make prediction
+        elif self.fusion == "Aconcat":
+            fusion = self.mm(
+                torch.concat(
+                    (
+                        (1 - self.alpha) * (cls_token_pathomics_encoder + cls_token_pathomics_decoder) / 2,
+                        self.alpha * (cls_token_genomics_encoder + cls_token_genomics_decoder) / 2,
+                    ),
+                    dim=1,
+                )
+            )  #
+        elif self.fusion == "fineCoarse":
+            fusion_coarse = self.mm(
+                torch.concat(
+                    (
+                        cls_token_pathomics_encoder,
+                        cls_token_genomics_encoder,
+                    ),
+                    dim=1
+                )
+            )
+            fusion_fine = self.mm(
+                torch.concat(
+                    (
+                        cls_token_pathomics_decoder,
+                        cls_token_genomics_decoder,
+                    ),
+                    dim=1
+                )
+            )
+            fusion=self.beta * fusion_fine + (1-self.beta) * fusion_coarse
         elif self.fusion == "bilinear":
             fusion = self.mm(
                 (cls_token_pathomics_encoder + cls_token_pathomics_decoder) / 2,
                 (cls_token_genomics_encoder + cls_token_genomics_decoder) / 2,
             )  # take cls token to make prediction
+        elif self.fusion == "hyperbolic":
+            # Step 1: Compute the average of pathomics encoder and decoder cls tokens
+            # print("hyperbolic")
+            pathomics_avg = (cls_token_pathomics_encoder + cls_token_pathomics_decoder) / 2
+            genomics_avg = (cls_token_genomics_encoder + cls_token_genomics_decoder) / 2
+
+            # Step 2: Concatenate the averaged features from pathomics and genomics
+            concatenated_features = torch.cat((pathomics_avg, genomics_avg), dim=1)
+
+            # Step 3: Wrap the concatenated features as a tangent vector on the manifold
+            tangent_features = TangentTensor(data=concatenated_features, man_dim=1, manifold=manifold)
+
+            # Step 4: Map the tangent vector to the manifold using the exponential map
+            hy_features = manifold.expmap(tangent_features)
+
+            # Step 5: Apply hyperbolic matrix multiplication to map features within the hyperbolic space
+            fusion_hy= self.hyperbolic_mm(hy_features)
+
+            # Define the origin point on the manifold for logmap
+            # origin = torch.zeros_like(fusion_hy.tensor)  # Assuming the origin is a zero tensor of the same shape
+
+            # Map the fusion tensor back to Euclidean space using the logarithmic map
+            # log_mapped_fusion = manifold.logmap(origin, fusion_hy)
+
+            # Step 7: Retrieve the tensor from the log-mapped structure
+            fusion = fusion_hy.tensor
         else:
             raise NotImplementedError("Fusion [{}] is not implemented".format(self.fusion))
-
+        # fusion=( cls_token_genomics_decoder +  cls_token_genomics_encoder) / 2
+        # fusion = (cls_token_pathomics_encoder + cls_token_pathomics_decoder) / 2
+        # predict
         # predict
         logits = self.classifier(fusion)  # [1, n_classes]
         hazards = torch.sigmoid(logits)
         S = torch.cumprod(1 - hazards, dim=1)
-        return hazards, S, cls_token_pathomics_encoder, cls_token_pathomics_decoder, cls_token_genomics_encoder, cls_token_genomics_decoder
+        return hazards, S, cls_token_pathomics_encoder, cls_token_pathomics_decoder, cls_token_genomics_encoder, cls_token_genomics_decoder,Nloss2+Nloss1
