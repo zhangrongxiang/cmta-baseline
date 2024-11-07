@@ -31,12 +31,13 @@ def main(args):
     set_seed(args.seed)
 
     # create results directory
-    results_dir = "./results/{dataset}/[{model}]-[{fusion}]-[{alpha}]-[{time}]".format(
+    results_dir = "./results/{dataset}/[{model}]-[{fusion}]-[{alpha}]-[{time}]-[{modality}]".format(
         dataset=args.dataset,
         model=args.model,
         fusion=args.fusion,
         alpha=args.alpha,
         time=time.strftime("%Y-%m-%d]-[%H-%M-%S"),
+        modality=args.modal,
     )
     if not os.path.exists(results_dir):
         os.makedirs(results_dir)
